@@ -1,20 +1,3 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
- *
- *    http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 import org.apache.spark.SparkConf
 
 import java.util.Random
@@ -24,23 +7,27 @@ import org.apache.spark.SparkContext._
 import org.apache.log4j.{ LogManager, Level }
 import java.io._
 
-/**
- * K-means clustering.
- */
-object SparkKMeans {
+object KMeans {
   // LogManager.getRootLogger().setLevel(Level.WARN)
 
-  def parseVector(line: String): Vector = {
+  // convert a string of type: "0.00 0.00 0.00 ..." to a vector of doubles
+  def lineToDoubles(line: String): Vector = {
     new Vector(line.split(' ').map(_.toDouble))
   }
+
+  def average(points: Seq[Vector]) : Vector = {
+    points.reduce(_+_) / points.length
+  }
   
-  def findClosest(p: Vector, centers: Seq[Vector]): Int = {
+  // Return the index of the closest centroid to given point.
+  // Calculated by finding minimum Euclidean Distance.
+  def closestCentroid(point: Vector, centroids: Seq[Vector]): Int = {
     var index = 0
     var bestIndex = 0
     var closest = Double.PositiveInfinity
   
-    for (i <- 0 until centers.length) {
-      val tempDist = p.squaredDist(centers(i))
+    for (i <- 0 until centroids.length) {
+      val tempDist = point.squaredDist(centroids(i))
       if (tempDist < closest) {
         closest = tempDist
         bestIndex = i
@@ -50,105 +37,108 @@ object SparkKMeans {
     bestIndex
   }
 
-  def average(points: Seq[Vector]) : Vector = {
-    points.reduce(_+_) / points.length
-  }
-
 
   def main(args: Array[String]) {
-    if (args.length < 5) {
+    if (args.length < 7) {
         println(args.length)
-        System.err.println("Usage: SparkLocalKMeans <master> <file> <k> <convergeDist> <output file> <number of simulations> <number of cores>")
+        System.err.println("Usage: sbt \"run <master> <file> <k> <convergeDist> <output file> <number of simulations> <number of cores>\"")
         System.exit(1)
     }
-    // Get constants from command line
+
+    /* 
+     * Preparation
+     */
+
     // 1) local | local[k] | spark://HOST:PORT | mesos://HOST:PORT
+    // locak[k] => run locally with k workers
     val sparkHost = args(0)
-    // 2) input filename, relative to project directory, e.g. myInputData.txt
+    // 2) input filename, relative to project directory, e.g. data/myInputData.txt
     val inputName = args(1)
-    // 3) number of clusters
+    // 3) number of k-clusters
     val K = args(2).toInt
     // 4) max change of the center of the clusters between iterations before the clustering stops
     val convergeDist = args(3).toDouble
+    // 5) file to write output to
     val outputFile = args(4)
-    // 5) number of simulations
+    // 6) number of simulations
     val numSimulations = args(5).toInt
+    // 7) number of cores for each worker
+    val numCores = args(6)
 
+
+    // create spark context
     val conf = new SparkConf()
              .setMaster(sparkHost)
-             .setAppName("kMeansRecur")
-             .set("spark.cores.max", args(6))
+             .setAppName("KMeans")
+             .set("spark.cores.max", numCores)
     val sc = new SparkContext(conf)
 
-    // Make Spark Context
-    // sc = new SparkContext(, , System.getenv("SPARK_HOME"), SparkContext.jarOfClass(this.getClass))
-
-    // Make an RDD (Resilient Distributed Dataset = basic data set to work with in Spark) of given textfile as first argument
+    // Make an RDD (Resilient Distributed Dataset = basic data set to work with in Spark) of given inputfile
     val textFile = sc.textFile(inputName)
 
     // Get a list of points (point = vector of "coordinates") from the input data
-    // Line input format: (x y z ...)
-    val points = textFile.map( line => new Vector(line.split(' ').map(_.toDouble)))
+    val points = textFile.map(lineToDoubles _)
 
-    // Cache the points in memory of the clusters, because we are going to need it a lot.
+    // Cache the points in memory of the clusters!
     points.cache()
 
-    /* 
-     * The actual k-means algorithm
-     * Based on pseudo code: http://en.wikibooks.org/wiki/Data_Mining_Algorithms_In_R/Clustering/K-Means
-     */
 
+    
+    /* perform the algorithm a given number of times to average out benchmarks */
     var benchmarks : Seq[Long] = Seq()
     for (i <- (1 until numSimulations)) {
+
+
+      /* 
+       * The actual k-means algorithm
+       * Based on pseudo code: http://en.wikibooks.org/wiki/Data_Mining_Algorithms_In_R/Clustering/K-Means
+       */
+
+      // * start benchmarking
+      val start = System.nanoTime
+      
+      // accumulator that will be used to compute the total distance that all centroids moved in this iteration
       var dist = sc.accumulator(1.0)
 
-      // 1) Take k initial points as clusters
+      // 1) Take k random initial points as centroids
       var centroids = points.takeSample(false, K, scala.util.Random.nextInt)
 
 
-       // 2) start iterations
-      val start = System.nanoTime
-      // while(dist.value > convergeDist) {
-      for (j <- (i until 100)) {
-        // for every point, find the closest centroid
-        val closest = points.map( point => (findClosest(point, centroids), point))
-
-        // accumulator for differences new centroids
+      // 2) start iterations
+      while(dist.value > convergeDist) {
+        // reset accumulator
         dist = sc.accumulator(0.0)
 
+        // for every point, find the closest centroid
+        val closest = points.map (point => (closestCentroid(point, centroids), point))
+
         // calculate new centroids + add difference to old centroids
-        centroids = closest.groupByKey().map{case(i, points) =>
+        centroids = closest.groupByKey().map {case(i, points) =>
           val newCentroid = average(points)
           dist += centroids(i).squaredDist(newCentroid)
           newCentroid
         }.collect()
     
-        // println("Finished iteration (delta = " + tempDist + ")")
+        println("delta = " + dist.value)
       }
 
-      // println("Final centers:")
-      // kPoints.foreach(println)
 
-
+      // * stop benchmarking
       val micros = (System.nanoTime - start) / 1000
       benchmarks = micros +: benchmarks
       println("%d: %d".format(i, micros))
     }
-    
 
+    // print benchmarks
+    benchmarks = benchmarks.reverse
     benchmarks.foreach( micro => println(micro))
     println("\n => %d".format(benchmarks.reduce(_+_)/benchmarks.length))
+
+    // write to output file
     val pw = new PrintWriter(outputFile)
     benchmarks.foreach(pw.println(_))
     pw.close
-    
-    // Print results
-    // val finalCentroids = result._1
-    // val dist = result._2
-    // println("Final centers:")
-    // finalCentroids.foreach(println)
-    // println("Clusters:")
-    // points.toArray.foreach(point => println(point + " => " + (finalCentroids(findClosest(point, finalCentroids)))))
+
     System.exit(0)
   }
 }
